@@ -17,7 +17,8 @@ class NotificationPropertiesTest {
     @Test
     void 合法配置_租约60s_总超时15s_通过() {
         NotificationProperties.Http http = new NotificationProperties.Http(3_000, 15_000);
-        assertThatCode(() -> new NotificationProperties(DISPATCH, http, RETRY))
+        // 接入侧参数传 null 走默认值；本测试只关心 D4.5 断言
+        assertThatCode(() -> new NotificationProperties(DISPATCH, http, RETRY, null, null, null))
                 .doesNotThrowAnyException();
     }
 
@@ -26,7 +27,7 @@ class NotificationPropertiesTest {
         // 租约 15s = 总超时 15s，无余量：慢请求期间租约先过期 → 双投
         NotificationProperties.Http http = new NotificationProperties.Http(3_000, 15_000);
         NotificationProperties.Dispatch badDispatch = new NotificationProperties.Dispatch(500, 100, 15);
-        assertThatThrownBy(() -> new NotificationProperties(badDispatch, http, RETRY))
+        assertThatThrownBy(() -> new NotificationProperties(badDispatch, http, RETRY, null, null, null))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("lease-duration-seconds");
     }
@@ -36,7 +37,7 @@ class NotificationPropertiesTest {
         // 15s + 5s 余量 = 20s；租约恰好 20s 不满足「>」，同样拒绝
         NotificationProperties.Http http = new NotificationProperties.Http(3_000, 15_000);
         NotificationProperties.Dispatch badDispatch = new NotificationProperties.Dispatch(500, 100, 20);
-        assertThatThrownBy(() -> new NotificationProperties(badDispatch, http, RETRY))
+        assertThatThrownBy(() -> new NotificationProperties(badDispatch, http, RETRY, null, null, null))
                 .isInstanceOf(IllegalStateException.class);
     }
 }

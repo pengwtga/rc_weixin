@@ -18,7 +18,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health,info,metrics,prometheus
 
 notification:
   dispatch:
@@ -33,3 +33,21 @@ notification:
     total-timeout-ms: 15000
   retry:
     default-max-attempts: 10
+  api:
+    # API Key → caller_id 注册表（T3.2）。演示用静态配置；生产应从密管/配置中心读取。
+    # 轮换 Key 时不改 caller_id：幂等域与历史数据不受影响。
+    callers:
+      dev-key-ads: sys_ads
+      dev-key-crm: sys_crm
+      dev-key-inventory: sys_inventory
+    rate-limit:
+      # 令牌桶（T3.5）：桶深容忍脉冲，恒定补充限平均速率
+      capacity: 100
+      refill-per-second: 20
+  backpressure:
+    # 队列积压安全水位（T3.6）。worker 200 × 保守周转 ≈ 5 万（§8）
+    max-pending: 50000
+  url-policy:
+    # D10 第一道闸：接入层只查 scheme / 字面量私网 IP / 白名单；解析后 IP 校验在投递层 P6
+    require-https: true
+    allowed-hosts: []   # 空列表 = 不启用白名单
