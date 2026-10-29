@@ -18,7 +18,8 @@ public record NotificationProperties(
         Retry retry,
         Api api,
         Backpressure backpressure,
-        UrlPolicy urlPolicy) {
+        UrlPolicy urlPolicy,
+        Crypto crypto) {
 
     /** 租约必须超出 HTTP 总超时的最小余量（秒）——覆盖 GC 停顿、结果落库耗时。 */
     private static final int LEASE_MARGIN_SECONDS = 5;
@@ -41,6 +42,9 @@ public record NotificationProperties(
         }
         if (urlPolicy == null) {
             urlPolicy = new UrlPolicy(true, java.util.List.of());
+        }
+        if (crypto == null) {
+            crypto = new Crypto(null, null, false);
         }
         assertLeaseLongerThanHttpTimeout(dispatch, http);
     }
@@ -99,5 +103,68 @@ public record NotificationProperties(
      * @param allowedHosts 出站域名白名单（按 caller 维度可演进）；空列表 = 不启用白名单
      */
     public record UrlPolicy(boolean requireHttps, java.util.List<String> allowedHosts) {
+    }
+
+    /**
+     * 载荷保护参数（D10）：请求体/请求头密封 + 请求体指纹。
+     *
+     * <p>两把密钥互相独立 —— 密封密钥泄漏不应连带削弱指纹的不可伪造性（密钥分离原则）。
+     * 生产环境由环境变量注入（{@code NOTIFY_BODY_KEY} / {@code NOTIFY_FP_KEY}），
+     * 最终应接到 KMS/密管；仓库里只放开发用的兜底值。</p>
+     *
+     * @param bodyKey        AES-256-GCM 密钥，Base64 编码的 32 字节
+     * @param fingerprintKey HMAC-SHA256 密钥，Base64 编码的 32 字节
+     * @param rejectDevKeys  为 true 时拒绝内置开发密钥 —— 生产 profile 必须开启，
+     *                       否则"加密"只是把明文换了个名字（密钥和代码一起躺在仓库里）
+     */
+    public record Crypto(String bodyKey, String fingerprintKey, boolean rejectDevKeys) {
+
+        /** 开发兜底密钥（32 字节）。生产必须通过环境变量覆盖。 */
+        public static final String DEV_BODY_KEY = "ZGV2LW9ubHktYm9keS1rZXktMzItYnl0ZXMtMDAwMDE=";
+        public static final String DEV_FINGERPRINT_KEY = "ZGV2LW9ubHktZnAta2V5LTMyLWJ5dGVzLTAwMDAwMDE=";
+
+        public Crypto {
+            bodyKey = bodyKey == null || bodyKey.isBlank() ? DEV_BODY_KEY : bodyKey;
+            fingerprintKey = fingerprintKey == null || fingerprintKey.isBlank() ? DEV_FINGERPRINT_KEY : fingerprintKey;
+
+            byte[] decodedBody = decodeKey(bodyKey, "notification.crypto.body-key");
+            byte[] decodedFp = decodeKey(fingerprintKey, "notification.crypto.fingerprint-key");
+
+            if (rejectDevKeys) {
+                if (DEV_BODY_KEY.equals(bodyKey) || DEV_FINGERPRINT_KEY.equals(fingerprintKey)) {
+                    throw new IllegalStateException(
+                            "配置错误（D10）：notification.crypto.reject-dev-keys=true 时禁止使用内置开发密钥，"
+                                    + "必须通过环境变量 NOTIFY_BODY_KEY / NOTIFY_FP_KEY 注入真实密钥");
+                }
+            }
+            if (java.util.Arrays.equals(decodedBody, decodedFp)) {
+                // 同一把密钥兼作两种用途，会削弱密钥分离 —— 拒绝而不是警告
+                throw new IllegalStateException(
+                        "配置错误（D10）：body-key 与 fingerprint-key 不得相同（密钥分离）");
+            }
+        }
+
+        private static byte[] decodeKey(String base64, String propertyName) {
+            try {
+                byte[] bytes = java.util.Base64.getDecoder().decode(base64);
+                if (bytes.length != 32) {
+                    throw new IllegalStateException("配置错误（D10）：%s 必须是 Base64 编码的 32 字节，实际 %d 字节"
+                            .formatted(propertyName, bytes.length));
+                }
+                return bytes;
+            } catch (IllegalArgumentException e) {
+                throw new IllegalStateException("配置错误（D10）：%s 不是合法的 Base64".formatted(propertyName), e);
+            }
+        }
+
+        /** 解码后的 AES 密钥字节。 */
+        public byte[] bodyKeyBytes() {
+            return java.util.Base64.getDecoder().decode(bodyKey);
+        }
+
+        /** 解码后的 HMAC 密钥字节。 */
+        public byte[] fingerprintKeyBytes() {
+            return java.util.Base64.getDecoder().decode(fingerprintKey);
+        }
     }
 }

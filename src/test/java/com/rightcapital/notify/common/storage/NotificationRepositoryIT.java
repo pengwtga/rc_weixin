@@ -106,7 +106,7 @@ class NotificationRepositoryIT {
         NotificationRow r = row("01TESTNO0000000000000000G", "sys_ads", "order_paid:p5");
         // 把 next_attempt_at 推到未来：模拟退避中
         NotificationRow future = new NotificationRow(0, r.notificationNo(), r.callerId(), r.idempotencyKey(),
-                r.targetUrl(), r.httpMethod(), r.headersEnc(), r.bodyEnc(), r.bodySha256(),
+                r.targetUrl(), r.httpMethod(), r.headersEnc(), r.bodyEnc(), r.bodyFingerprint(),
                 "PENDING", 0, 10, 0,
                 new Timestamp(System.currentTimeMillis() + 60_000),
                 null, null, null, null, r.createdAt(), r.updatedAt());

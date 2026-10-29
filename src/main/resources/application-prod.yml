@@ -1,0 +1,12 @@
+# 生产 profile：只放开一条硬约束 —— 拒绝内置开发密钥。
+#
+# 不设这一条，"加密"只是把明文换了个名字：密钥与代码一起躺在仓库里，
+# 任何拿到代码的人都能解开数据库里的 body（D10 的实质要求是"密钥与数据分离"）。
+spring:
+  config:
+    activate:
+      on-profile: prod
+
+notification:
+  crypto:
+    reject-dev-keys: true

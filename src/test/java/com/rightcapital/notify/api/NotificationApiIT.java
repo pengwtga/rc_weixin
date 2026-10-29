@@ -205,6 +205,42 @@ class NotificationApiIT {
     }
 
     @Test
+    void 落库的请求体是密文_库里看不到明文PII与凭证() throws Exception {
+        String plainBody = "{\"phone\":\"13800138000\",\"amount\":19900}";
+        Map<String, Object> body = Map.of(
+                "idempotencyKey", "order_paid:crypto",
+                "targetUrl", "https://hooks.vendor.example.com/v1/events",
+                "body", plainBody,
+                "headers", Map.of("Authorization", "Bearer super-secret-token"));
+        assertThat(rest.exchange("/v1/notifications", HttpMethod.POST, entity(body, KEY), Map.class)
+                .getStatusCode().value()).isEqualTo(202);
+
+        Map<String, Object> row = jdbc.queryForMap(
+                "SELECT body_enc, headers_enc, body_fingerprint FROM notification WHERE idempotency_key = ?",
+                "order_paid:crypto");
+        byte[] bodyEnc = (byte[]) row.get("body_enc");
+        byte[] headersEnc = (byte[]) row.get("headers_enc");
+
+        // D10：数据库被拖走时，攻击者直接读不到 PII 与供应商凭证
+        assertThat(new String(bodyEnc, java.nio.charset.StandardCharsets.ISO_8859_1))
+                .doesNotContain("13800138000");
+        assertThat(new String(headersEnc, java.nio.charset.StandardCharsets.ISO_8859_1))
+                .doesNotContain("super-secret-token");
+
+        // 密封后体积 = 1B 版本 + 12B IV + 密文 + 16B tag，必然大于明文
+        assertThat(bodyEnc.length).isGreaterThan(plainBody.length());
+        assertThat(headersEnc.length).isGreaterThan("super-secret-token".length());
+
+        // 指纹是密钥化的 HMAC-SHA256：64 位十六进制，且不等于裸 SHA-256
+        String fp = (String) row.get("body_fingerprint");
+        assertThat(fp).hasSize(64).matches("[0-9a-f]{64}");
+        String bareSha256 = java.util.HexFormat.of().formatHex(
+                java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(plainBody.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        assertThat(fp).isNotEqualTo(bareSha256);
+    }
+
+    @Test
     void 埋点可见_接入事件计数已注册() {
         // 先触发任意一次接入（成功/限流/背压都会注册 notification.api.events 下的计数），
         // 保证用例自包含、不依赖执行顺序

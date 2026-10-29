@@ -18,7 +18,7 @@ class UrlPolicyTest {
     private UrlPolicy policy(boolean requireHttps, List<String> allowedHosts) {
         NotificationProperties properties = new NotificationProperties(
                 null, null, null, null, null,
-                new NotificationProperties.UrlPolicy(requireHttps, allowedHosts));
+                new NotificationProperties.UrlPolicy(requireHttps, allowedHosts), null);
         return new UrlPolicy(properties);
     }
 

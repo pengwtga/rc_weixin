@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.rightcapital.notify.api.dto.CreateNotificationRequest;
 import com.rightcapital.notify.api.dto.CreateNotificationResponse;
 import com.rightcapital.notify.common.apierror.ApiException;
+import com.rightcapital.notify.common.crypto.ContentFingerprint;
+import com.rightcapital.notify.common.crypto.PayloadCipher;
 import com.rightcapital.notify.common.idgen.Ulid;
 import com.rightcapital.notify.common.storage.NotificationRepository;
 import com.rightcapital.notify.common.storage.NotificationRepository.NotificationRow;
@@ -15,10 +17,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
-import java.util.HexFormat;
 
 /**
  * 受理服务（T3.3/T3.4）：校验 → 落库 → 202。
@@ -42,6 +42,8 @@ public class NotificationService {
     private final NotificationProperties properties;
     private final ObjectMapper objectMapper;
     private final io.micrometer.core.instrument.MeterRegistry meterRegistry;
+    private final PayloadCipher payloadCipher;
+    private final ContentFingerprint fingerprint;
 
     public NotificationService(NotificationRepository repository,
                                UrlPolicy urlPolicy,
@@ -49,7 +51,9 @@ public class NotificationService {
                                BackpressureGuard backpressureGuard,
                                NotificationProperties properties,
                                ObjectMapper objectMapper,
-                               io.micrometer.core.instrument.MeterRegistry meterRegistry) {
+                               io.micrometer.core.instrument.MeterRegistry meterRegistry,
+                               PayloadCipher payloadCipher,
+                               ContentFingerprint fingerprint) {
         this.repository = repository;
         this.urlPolicy = urlPolicy;
         this.rateLimiter = rateLimiter;
@@ -57,6 +61,8 @@ public class NotificationService {
         this.properties = properties;
         this.objectMapper = objectMapper;
         this.meterRegistry = meterRegistry;
+        this.payloadCipher = payloadCipher;
+        this.fingerprint = fingerprint;
     }
 
     /**
@@ -77,17 +83,25 @@ public class NotificationService {
         urlPolicy.check(request.targetUrl());
 
         Timestamp now = new Timestamp(System.currentTimeMillis());
-        byte[] bodyBytes = request.body() == null ? null : request.body().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        String notificationNo = Ulid.next();
+        byte[] bodyBytes = request.body() == null ? null : request.body().getBytes(StandardCharsets.UTF_8);
+
+        // 密封发生在落库之前：明文 body（含手机号/邮箱/金额）与 headers（含供应商凭证）
+        // 不经过任何持久化路径。指纹取的是明文，用于归档清空 body 后的"内容是否一致"比对。
+        byte[] sealedBody = payloadCipher.seal(bodyBytes, PayloadCipher.aadFor(notificationNo, "body"));
+        byte[] sealedHeaders = payloadCipher.seal(toJsonBytes(request.headers()),
+                PayloadCipher.aadFor(notificationNo, "headers"));
+
         NotificationRow row = new NotificationRow(
                 0,
-                Ulid.next(),
+                notificationNo,
                 callerId,
                 request.idempotencyKey(),
                 request.targetUrl(),
                 request.httpMethod(),
-                toJson(request.headers()),
-                bodyBytes,
-                sha256Hex(bodyBytes),
+                sealedHeaders,
+                sealedBody,
+                fingerprint.of(bodyBytes),
                 "PENDING",
                 0,
                 properties.retry().defaultMaxAttempts(),
@@ -117,26 +131,15 @@ public class NotificationService {
         }
     }
 
-    private String toJson(Object headers) {
+    /** headers 序列化为 UTF-8 字节；空/nil 返回 null（与"没有 headers"同义，密封后落 NULL）。 */
+    private byte[] toJsonBytes(Object headers) {
         if (headers == null || (headers instanceof java.util.Map<?, ?> m && m.isEmpty())) {
             return null;
         }
         try {
-            return objectMapper.writeValueAsString(headers);
+            return objectMapper.writeValueAsBytes(headers);
         } catch (JsonProcessingException e) {
             throw new IllegalArgumentException("headers 无法序列化", e);
-        }
-    }
-
-    private static String sha256Hex(byte[] body) {
-        if (body == null || body.length == 0) {
-            // 空体也要有指纹：保持「body_sha256 非空」的 DDL 约束，避免两种语义
-            body = new byte[0];
-        }
-        try {
-            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(body));
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("JVM 缺少 SHA-256", e);
         }
     }
 

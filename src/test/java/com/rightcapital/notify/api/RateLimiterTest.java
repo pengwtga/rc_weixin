@@ -13,7 +13,7 @@ class RateLimiterTest {
                 null, null, null,
                 new NotificationProperties.Api(java.util.Map.of(),
                         new NotificationProperties.RateLimit(capacity, refillPerSecond)),
-                null, null);
+                null, null, null);
         return new RateLimiter(properties, new SimpleMeterRegistry());
     }
 

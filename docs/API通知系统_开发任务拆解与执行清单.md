@@ -97,7 +97,9 @@ P6 与 P7 可并行；P8 的部分用例可在 P4 完成后提前编写。
 | T2.3 | 状态机枚举 + 合法迁移校验 | `NotificationStatus` | 非法迁移（如 SUCCEEDED→PROCESSING）抛异常，且有单测 | T2.1 | M |
 | T2.4 | Repository：插入、按幂等键查、按单号查、状态更新 | `NotificationRepository` | 有 Testcontainers 集成测试 | T2.1 | M |
 | T2.5 | **认领 SQL**：`SKIP LOCKED` 批量认领 + 租约回收 | `NotificationRepository.claimDue()` | 见 T4.2 DoD | T2.4 | M |
-| T2.6 | 归档任务（成功 24h / 失败 7d 后清理 body 明文） | `ArchiveJob` | 定时执行，跑完 body_enc 置空、`body_sha256` 保留；分批（LIMIT 循环）不产生大事务 | T2.1 | S |
+| T2.6 | 归档任务（成功 24h / 失败 7d 后清理 body 明文） | `ArchiveJob` | 定时执行，跑完 body_enc 置空、`body_fingerprint` 保留；分批（LIMIT 循环）不产生大事务 | T2.1 | S |
+| T2.7 | V4 迁移：`body_sha256 → body_fingerprint` 改名 + `headers_enc` 改 `MEDIUMBLOB` | `V4__encrypt_payloads.sql` | `mvn verify` 后 Flyway 版本到 v4；两业务表无空注释列；**不改写已提交的 V2**（迁移文件不可变） | T2.2 | S |
+| T2.8 | 明文回填任务（仅"已有存量数据"的部署需要） | 一次性 Job | 分批（LIMIT 循环）扫描 `body_enc` 解密失败的行视为旧明文 → 重新密封写回；回填期间读路径兼容明文；**已实测：V4 只改列类型，不回溯加密旧行** | T2.7 | C |
 
 > **归档任务在解决两个问题（都不是"顺手清理"）**：① **合规**——注册/付款事件的 body 含手机号、邮箱、金额，"PII 最小留存"是 D10 的硬要求，保留期一到必须清明文（`body_sha256` 保留供排查）；② **扫描效率**——到期扫描走 `(status, next_attempt_at)` 索引，已完结行留在热索引里会拉深 B+ 树、降低 buffer pool 命中率，且 MEDIUMBLOB 溢出页占空间。首版只清 body（UPDATE 置空）；到 V1（日 > 300 万）再把已完结行整体搬到归档表。之所以不用分区表，见下一条坑。
 
@@ -114,6 +116,7 @@ P6 与 P7 可并行；P8 的部分用例可在 P4 完成后提前编写。
 | T3.5 | 按 caller 令牌桶限流 → `429 + Retry-After` | `RateLimiter` | 超限返回 429，头带 Retry-After | T3.2 | S |
 | T3.6 | 队列健康度守卫 → `503 + Retry-After` | `BackpressureGuard` | 阈值可配；超阈值时新请求不落库 | T3.5 | S |
 | T3.7 | 接入侧埋点（QPS / 拒绝数 / 幂等命中数） | Micrometer | Prometheus 端点可见 | T3.4 | S |
+| T3.8 | 载荷保护：body/headers 落库前 AES-256-GCM 密封 + 指纹改 HMAC-SHA256（D10.1–D10.3） | `PayloadCipher` / `ContentFingerprint` / `CryptoConfig` | ① 库里 `body_enc`/`headers_enc` 搜不到明文手机号与凭证；② 同一明文两次密封密文不同但都能还原；③ 篡改 1 bit 或跨行搬运密文 → 解密失败；④ 指纹 64 位十六进制、**≠ 裸 SHA-256**、同明文稳定；⑤ 密钥非 32 字节 / 与指纹密钥相同 / prod 用内置开发密钥 → **启动失败** | T3.1 | S |
 
 > **M1 里程碑**：T3.4 完成后，用一条固定 URL 提交，DB 里能看到 `PENDING` 记录 —— 端到端最窄链路打通。
 

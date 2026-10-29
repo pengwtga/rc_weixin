@@ -37,7 +37,13 @@ public class NotificationRepository {
         this.jdbc = jdbc;
     }
 
-    /** notification 表的行映射（字段与 V2 DDL 一一对应）。 */
+    /**
+     * notification 表的行映射（字段与 V4 迁移后的结构一致）。
+     *
+     * <p>{@code headersEnc} / {@code bodyEnc} 是 AES-256-GCM 密封后的二进制
+     * （{@code [1B 版本][12B IV][密文+tag]}），不是明文 —— 名字里的 Enc 是承诺，不是修饰。
+     * {@code bodyFingerprint} 是明文的 HMAC-SHA256（密钥化指纹），归档清空 body 后仍保留。</p>
+     */
     public record NotificationRow(
             long id,
             String notificationNo,
@@ -45,9 +51,9 @@ public class NotificationRepository {
             String idempotencyKey,
             String targetUrl,
             String httpMethod,
-            String headersEnc,
+            byte[] headersEnc,
             byte[] bodyEnc,
-            String bodySha256,
+            String bodyFingerprint,
             String status,
             int attemptCount,
             int maxAttempts,
@@ -66,11 +72,11 @@ public class NotificationRepository {
         jdbc.update("""
                 INSERT INTO notification
                   (notification_no, caller_id, idempotency_key, target_url, http_method,
-                   headers_enc, body_enc, body_sha256, status, max_attempts, next_attempt_at)
+                   headers_enc, body_enc, body_fingerprint, status, max_attempts, next_attempt_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
                 """,
                 row.notificationNo(), row.callerId(), row.idempotencyKey(), row.targetUrl(), row.httpMethod(),
-                row.headersEnc(), row.bodyEnc(), row.bodySha256(), row.maxAttempts(), row.nextAttemptAt());
+                row.headersEnc(), row.bodyEnc(), row.bodyFingerprint(), row.maxAttempts(), row.nextAttemptAt());
     }
 
     /** 按 (caller, idempotency_key) 查已有通知 —— 幂等冲突时返回原单号。 */

@@ -51,3 +51,10 @@ notification:
     # D10 第一道闸：接入层只查 scheme / 字面量私网 IP / 白名单；解析后 IP 校验在投递层 P6
     require-https: true
     allowed-hosts: []   # 空列表 = 不启用白名单
+  crypto:
+    # 载荷保护（D10）：两把密钥必须互相独立（密钥分离），各为 Base64 的 32 字节。
+    # 生产必须由环境变量注入（NOTIFY_BODY_KEY / NOTIFY_FP_KEY）并配合 prod profile
+    # （reject-dev-keys=true 会拒绝下面的开发兜底值）。真实项目应接 KMS / 信封加密。
+    body-key: ${NOTIFY_BODY_KEY:}
+    fingerprint-key: ${NOTIFY_FP_KEY:}
+    reject-dev-keys: false
