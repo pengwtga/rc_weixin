@@ -1,0 +1,35 @@
+spring:
+  application:
+    name: rc_weixin
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:13307}/${MYSQL_DB:notification}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&connectionTimeZone=UTC
+    username: ${MYSQL_USER:notify}
+    password: ${MYSQL_PASS:notify}
+    hikari:
+      maximum-pool-size: 20
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+notification:
+  dispatch:
+    # 轮询间隔（毫秒）。强时效接入时可调低（§9.8），或走 insert-then-hint（T4.12）
+    poll-interval-ms: 500
+    # 单轮认领条数。必须 <= 空闲 worker 数，否则自己制造重复认领（D4.5）
+    batch-size: 100
+    # 租约时长（秒）。启动时断言：必须 > http.total-timeout-ms + 余量（D4.5）
+    lease-duration-seconds: 60
+  http:
+    connect-timeout-ms: 3000
+    total-timeout-ms: 15000
+  retry:
+    default-max-attempts: 10

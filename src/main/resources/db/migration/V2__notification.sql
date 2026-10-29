@@ -1,0 +1,30 @@
+-- V2：通知投递任务表 —— 本身即队列：SKIP LOCKED 认领 + 租约实现可见性超时（设计文档 §3.3 / D4）
+CREATE TABLE notification (
+  id               BIGINT UNSIGNED   NOT NULL AUTO_INCREMENT COMMENT '自增主键，仅内部使用；对外一律用 notification_no',
+  notification_no  CHAR(26)          NOT NULL                COMMENT '对外唯一单号（ULID，26 字符）。日志、查询接口、注入下游的 X-Notification-Id 都用它',
+  caller_id        VARCHAR(64)       NOT NULL                COMMENT '调用方（业务系统）标识，由 API Key 解析得到；用于鉴权、限流、幂等域与数据隔离',
+  idempotency_key  VARCHAR(128)      NOT NULL                COMMENT '【事件级】幂等键：标识"这一次通知提交"，不是订单/用户的 ID。建议 <事件类型>:<事件唯一ID>，如 order_paid:pay_20261028_001。与 caller_id 组成唯一键，防同一事件被重复提交；同一订单的多条通知各用各的键（见 §3.6）',
+  target_url       VARCHAR(2048)     NOT NULL                COMMENT '外部供应商 API 完整地址；落库前经 SSRF 校验（仅 HTTPS / 拒绝私网与回环 / 域名白名单）',
+  http_method      VARCHAR(8)        NOT NULL DEFAULT 'POST' COMMENT 'HTTP 方法；白名单 POST/PUT/PATCH/DELETE/GET',
+  headers_enc      TEXT              NULL                    COMMENT '请求头（JSON 序列化），含供应商凭证；AES-GCM 加密存储，查询接口脱敏返回，日志不打印',
+  body_enc         MEDIUMBLOB        NULL                    COMMENT '请求体原始字节；加密存储。保留期由归档任务控制（成功 24h / 失败 7d 后清除）',
+  body_sha256      CHAR(64)          NOT NULL                COMMENT 'body 明文的 SHA-256（十六进制）。归档清除 body 后仍保留，用于排查与完整性校验',
+  status           VARCHAR(16)       NOT NULL DEFAULT 'PENDING' COMMENT '状态机：PENDING/RETRY_WAIT/PROCESSING/SUCCEEDED/DEAD/CANCELED；仅 DEAD 可由 replay 回到 PENDING',
+  attempt_count    SMALLINT UNSIGNED NOT NULL DEFAULT 0      COMMENT '累计已消耗的尝试次数，在【认领时】自增（非完成后）；熔断跳过需回退；达到 max_attempts 转 DEAD',
+  max_attempts     TINYINT UNSIGNED  NOT NULL DEFAULT 10     COMMENT '重试预算上限，由 RetryPolicy 档位（STANDARD/LONG_TAIL/FAST_FAIL）决定；replay 时按档位追加',
+  replay_epoch     SMALLINT UNSIGNED NOT NULL DEFAULT 0      COMMENT '重放轮次。0=首轮，每次 replay +1；用于区分 attempt 的归属，避免唯一键冲突（见 D8.4）',
+  next_attempt_at  DATETIME(3)       NOT NULL                COMMENT '下次可投递时刻（UTC）。到期扫描的唯一排序键；退避、熔断跳过、摊平重放都改这个字段',
+  lease_owner      VARCHAR(64)       NULL                    COMMENT '当前持有租约的实例 ID；NULL 表示未被占用。仅用于排查，不参与认领的 CAS 判断',
+  lease_until      DATETIME(3)       NULL                    COMMENT '租约到期时刻（UTC，= 认领时刻 + 60s）。过期即视为持有者已崩溃，可被其他实例重新认领（见 D4）',
+  last_error_class VARCHAR(32)       NULL                    COMMENT '最近一次失败的归一化分类：TIMEOUT/DNS/TLS/CONN_REFUSED/REDIRECT_REFUSED/HTTP_4XX/HTTP_5XX；也是失败通知的路由依据',
+  last_status_code SMALLINT          NULL                    COMMENT '最近一次收到的 HTTP 状态码；网络层失败时为 NULL，与 last_error_class 配合排查',
+  created_at       DATETIME(3)       NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时刻（UTC），接入层落库时间',
+  updated_at       DATETIME(3)       NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '最后更新时刻（UTC），状态或租约变更时自动刷新',
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_idem        (caller_id, idempotency_key) COMMENT '接入侧幂等：同调用方 + 同业务键只允许一条，冲突时查回原单号',
+  UNIQUE KEY uk_no          (notification_no)            COMMENT '对外单号唯一，查询接口按它定位',
+  KEY idx_due               (status, next_attempt_at)    COMMENT '到期任务扫描（覆盖 PENDING / RETRY_WAIT）',
+  KEY idx_lease             (status, lease_until)        COMMENT '租约过期回收扫描（PROCESSING 且 lease_until < now）',
+  KEY idx_caller_status_ct  (caller_id, status, created_at) COMMENT '业务方按游标拉取失败清单（status=DEAD + created_at > cursor）'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='通知投递任务表 —— 本身即队列：SKIP LOCKED 认领 + 租约实现可见性超时';
