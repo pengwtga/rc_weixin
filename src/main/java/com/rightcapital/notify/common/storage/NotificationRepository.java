@@ -157,6 +157,124 @@ public class NotificationRepository {
         return n == null ? 0 : n;
     }
 
+    // ───────────────────────── 投递侧（P4） ─────────────────────────
+
+    /**
+     * 按单号精确认领一条（T4.12 insert-then-hint 专用）。
+     *
+     * <p>与 {@link #claimDue} 的区别：不做批量扫描，直接命中主键/唯一键。
+     * 受理成功后把单号塞进内存交接队列，调度器用它立刻认领 —— 省掉最长一个轮询间隔的延迟。
+     * 状态守卫与租约写法必须和 claimDue 完全一致，否则两条路径会打架：
+     * 同一条任务既可能被 hint 认领、也可能被轮询认领，靠的都是
+     * {@code WHERE status IN ('PENDING','RETRY_WAIT') AND next_attempt_at <= now}。</p>
+     *
+     * <p>返回 empty 是正常情况（已被别的实例认领、或还在退避期），不是错误。</p>
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public Optional<NotificationRow> claimByNo(String notificationNo, String workerId, int leaseSeconds) {
+        String claimToken = workerId + "#" + com.rightcapital.notify.common.idgen.Ulid.next();
+        int updated = jdbc.update("""
+                UPDATE notification
+                SET status = 'PROCESSING',
+                    lease_owner = ?,
+                    lease_until = DATE_ADD(UTC_TIMESTAMP(3), INTERVAL ? SECOND),
+                    attempt_count = attempt_count + 1
+                WHERE notification_no = ?
+                  AND status IN ('PENDING','RETRY_WAIT')
+                  AND next_attempt_at <= UTC_TIMESTAMP(3)
+                """, claimToken, leaseSeconds, notificationNo);
+        if (updated == 0) {
+            return Optional.empty();
+        }
+        return jdbc.query("""
+                        SELECT * FROM notification WHERE notification_no = ? AND lease_owner = ?
+                        """, ROW_MAPPER, notificationNo, claimToken)
+                .stream().findFirst();
+    }
+
+    /**
+     * 投递成功落定：SUCCEEDED + 清租约。
+     *
+     * <p><b>为什么要带 {@code lease_owner} 守卫</b>：如果一次投递耗时超过了租约时长
+     * （GC 长停顿、网络黑洞），租约会被别的实例回收并重新投递，此时本 worker 手里的
+     * 结果已经过期。不带守卫地写状态，就会出现"旧结果覆盖新结果"——
+     * 比如新 worker 已经判定 DEAD，旧 worker 慢悠悠地写回 SUCCEEDED。
+     * 返回 0 表示"我的租约已经不属于我了"，调用方必须丢弃本次结果并记一笔僵尸投递。</p>
+     *
+     * @return 影响行数；0 表示租约已失效，本次结果不得采信
+     */
+    public int finishSucceeded(long id, String leaseOwner, Integer statusCode) {
+        return jdbc.update("""
+                UPDATE notification
+                SET status = 'SUCCEEDED',
+                    lease_owner = NULL,
+                    lease_until = NULL,
+                    last_error_class = NULL,
+                    last_status_code = ?
+                WHERE id = ? AND status = 'PROCESSING' AND lease_owner = ?
+                """, statusCode, id, leaseOwner);
+    }
+
+    /**
+     * 投递失败但可重试：RETRY_WAIT + 安排下次时间 + 清租约。
+     *
+     * @param delayMs 距下次尝试的延迟（P4 为固定值，P5 换成指数退避 + 抖动）
+     */
+    public int finishRetry(long id, String leaseOwner, long delayMs, String errorClass, Integer statusCode) {
+        return jdbc.update("""
+                UPDATE notification
+                SET status = 'RETRY_WAIT',
+                    lease_owner = NULL,
+                    lease_until = NULL,
+                    last_error_class = ?,
+                    last_status_code = ?,
+                    next_attempt_at = DATE_ADD(UTC_TIMESTAMP(3), INTERVAL ? MICROSECOND)
+                WHERE id = ? AND status = 'PROCESSING' AND lease_owner = ?
+                """, errorClass, statusCode, delayMs * 1000L, id, leaseOwner);
+    }
+
+    /**
+     * 投递失败且不可重试：DEAD + 清租约。
+     *
+     * <p>DEAD 不是"丢弃"，是"交给人的队列"：失败清单 API 可查、可单条/批量重放（P5）。
+     * 系统不假装自己能处理 401（凭证过期）这类问题 —— 它只能尽快停止烧预算并通知人。</p>
+     */
+    public int finishDead(long id, String leaseOwner, String errorClass, Integer statusCode) {
+        return jdbc.update("""
+                UPDATE notification
+                SET status = 'DEAD',
+                    lease_owner = NULL,
+                    lease_until = NULL,
+                    last_error_class = ?,
+                    last_status_code = ?
+                WHERE id = ? AND status = 'PROCESSING' AND lease_owner = ?
+                """, errorClass, statusCode, id, leaseOwner);
+    }
+
+    /**
+     * 退回队列并<b>回退 attempt_count</b>（T4.9 / T5.7 共用）。
+     *
+     * <p>适用场景：抢不到 per-host 并发许可、或 host 处于熔断打开状态。
+     * 这类"没发出去"的跳过<b>不是一次尝试</b> —— 如果照常计数，供应商挂 30 分钟，
+     * 健康任务会被自己的调度逻辑耗成 DEAD，等对方恢复时任务已经死了。
+     * 这是整个投递引擎里最容易写错的一处，所以单独一个方法、单独的测试。</p>
+     *
+     * <p>{@code GREATEST(attempt_count, 1) - 1} 而不是 {@code attempt_count - 1}：
+     * 列是 SMALLINT <b>UNSIGNED</b>，减到 -1 会直接报 "Out of range value"，
+     * 让一次本该无害的回退变成一条投递异常。</p>
+     */
+    public int requeueAndRefund(long id, String leaseOwner, long delayMs) {
+        return jdbc.update("""
+                UPDATE notification
+                SET status = 'RETRY_WAIT',
+                    attempt_count = GREATEST(attempt_count, 1) - 1,
+                    lease_owner = NULL,
+                    lease_until = NULL,
+                    next_attempt_at = DATE_ADD(UTC_TIMESTAMP(3), INTERVAL ? MICROSECOND)
+                WHERE id = ? AND status = 'PROCESSING' AND lease_owner = ?
+                """, delayMs * 1000L, id, leaseOwner);
+    }
+
     /** 测试辅助：清表（Testcontainers IT 用）。生产代码不得调用。 */
     void deleteAllForTest() {
         jdbc.update("DELETE FROM notification");

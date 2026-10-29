@@ -19,6 +19,20 @@ mvn spring-boot:run                 # 应用启动，Flyway 自动执行迁移
 curl http://localhost:8080/actuator/health
 ```
 
+## 当前进度
+
+| 阶段 | 状态 | 已交付 |
+|---|---|---|
+| P1 工程骨架 | ✅ | 6 模块边界、参数外置（含「租约 > HTTP 总超时」启动断言）、Flyway |
+| P2 数据模型 | ✅ | `notification` / `delivery_attempt`；SKIP LOCKED 认领 + 租约回收 |
+| P3 接入 API | ✅ | API Key 鉴权、两段式幂等键、令牌桶限流、背压守卫、AES-256-GCM 密封 + HMAC 指纹 |
+| P4 投递引擎 | ✅ | 认领→解密→发送→分类→登记→落定；per-host 并发隔离、hint 唤醒、优雅停机 |
+| P5 失败策略 | 待做 | 指数退避 + 抖动、per-host 熔断、死信清单与人工重放 |
+
+测试口径：`mvn test` 跑 78 个单元测试；`mvn verify` 追加 28 个集成测试（Testcontainers 真实 MySQL 8 + WireMock 真实 HTTP），共 106 个。
+
+P4 的实现与任务清单有 3 处不一致（JDK HttpClient 只有两段超时等），原因记在设计文档 §11，不藏在提交信息里。
+
 ## 技术栈
 
 Java 17 · Spring Boot 3.3 · MySQL 8（DB 即队列：SKIP LOCKED + 租约） · Flyway · JdbcTemplate

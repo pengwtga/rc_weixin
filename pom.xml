@@ -76,6 +76,15 @@
       <artifactId>junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- T4.4/T4.6 DoD：超时、5xx、429、重定向这些分支必须用真实 HTTP 服务验证。
+         WireMock 起在随机端口上，比 mock 掉 HttpClient 可信得多 ——
+         "我 mock 了 HttpClient 所以它一定不发重定向" 这种测试证明不了任何事 -->
+    <dependency>
+      <groupId>org.wiremock</groupId>
+      <artifactId>wiremock-standalone</artifactId>
+      <version>3.9.1</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>

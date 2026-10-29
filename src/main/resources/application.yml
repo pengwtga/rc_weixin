@@ -24,15 +24,28 @@ notification:
   dispatch:
     # 轮询间隔（毫秒）。强时效接入时可调低（§9.8），或走 insert-then-hint（T4.12）
     poll-interval-ms: 500
-    # 单轮认领条数。必须 <= 空闲 worker 数，否则自己制造重复认领（D4.5）
+    # 单轮认领条数上限。实际每轮认领 = min(batch-size, 空闲 worker 数)，见 D4.5
     batch-size: 100
     # 租约时长（秒）。启动时断言：必须 > http.total-timeout-ms + 余量（D4.5）
     lease-duration-seconds: 60
+    # 投递线程数 = 同时在途的 HTTP 上限。与 batch-size 是两个概念，别混
+    worker-pool-size: 32
+    # 队列持续为空时的最大轮询间隔（T4.10）。@Scheduled 仍按基础间隔醒来，但不碰 DB
+    idle-backoff-max-ms: 2000
+    # 单个下游 host 的并发上限（T4.9）：一家供应商变慢不该拖垮其他家
+    host-concurrency: 8
+    # 抢不到 host 许可时的重排延迟（毫秒）；此时回退 attempt_count，不算一次尝试
+    requeue-delay-ms: 200
+    # 停机时等待在途投递完成的上限（秒）；超时后交给租约自然回收
+    shutdown-await-seconds: 20
   http:
+    # connect 与 total 两段（JDK HttpClient 没有独立 read timeout，见 §9.9）
     connect-timeout-ms: 3000
     total-timeout-ms: 15000
   retry:
     default-max-attempts: 10
+    # P4 占位退避：固定延迟，只保证状态机闭环。P5 换成指数退避 + 抖动后此项退役
+    fixed-delay-seconds: 30
   api:
     # API Key → caller_id 注册表（T3.2）。演示用静态配置；生产应从密管/配置中心读取。
     # 轮换 Key 时不改 caller_id：幂等域与历史数据不受影响。

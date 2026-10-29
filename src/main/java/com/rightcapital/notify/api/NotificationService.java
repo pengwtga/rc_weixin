@@ -44,6 +44,7 @@ public class NotificationService {
     private final io.micrometer.core.instrument.MeterRegistry meterRegistry;
     private final PayloadCipher payloadCipher;
     private final ContentFingerprint fingerprint;
+    private final com.rightcapital.notify.dispatcher.DispatchHintQueue hintQueue;
 
     public NotificationService(NotificationRepository repository,
                                UrlPolicy urlPolicy,
@@ -53,7 +54,8 @@ public class NotificationService {
                                ObjectMapper objectMapper,
                                io.micrometer.core.instrument.MeterRegistry meterRegistry,
                                PayloadCipher payloadCipher,
-                               ContentFingerprint fingerprint) {
+                               ContentFingerprint fingerprint,
+                               com.rightcapital.notify.dispatcher.DispatchHintQueue hintQueue) {
         this.repository = repository;
         this.urlPolicy = urlPolicy;
         this.rateLimiter = rateLimiter;
@@ -63,6 +65,7 @@ public class NotificationService {
         this.meterRegistry = meterRegistry;
         this.payloadCipher = payloadCipher;
         this.fingerprint = fingerprint;
+        this.hintQueue = hintQueue;
     }
 
     /**
@@ -117,6 +120,9 @@ public class NotificationService {
         try {
             repository.insertPending(row);
             counter(callerId, "accepted").increment();
+            // T4.12 insert-then-hint：落库成功才发提示（顺序不能反 ——
+            // 先提示后落库，调度器可能认领不到而白跑；更糟的是落库失败时留下幻觉）
+            hintQueue.offer(row.notificationNo());
             log.info("通知已受理 no={} caller={} url={}", row.notificationNo(), callerId, request.targetUrl());
             return CreateNotificationResponse.created(row.notificationNo());
         } catch (DuplicateKeyException e) {

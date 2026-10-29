@@ -24,7 +24,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 中间经过鉴权（T3.2）、幂等（T3.3）、受理（T3.4）、限流（T3.5）。
  * M1 DoD：提交一条通知后，DB 里能看到 PENDING 记录。
  */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+// 关掉后台调度：受理用例只验证"落库为 PENDING"，不希望后台线程把它改成 PROCESSING/DEAD
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = "notification.dispatch.auto-start=false")
 @Testcontainers
 class NotificationApiIT {
 

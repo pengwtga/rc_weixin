@@ -26,13 +26,13 @@ public record NotificationProperties(
 
     public NotificationProperties {
         if (dispatch == null) {
-            dispatch = new Dispatch(500, 100, 60);
+            dispatch = new Dispatch(500, 100, 60, 32);
         }
         if (http == null) {
             http = new Http(3_000, 15_000);
         }
         if (retry == null) {
-            retry = new Retry(10);
+            retry = new Retry(10, 30);
         }
         if (api == null) {
             api = new Api(Map.of(), new RateLimit(100, 100));
@@ -60,22 +60,117 @@ public record NotificationProperties(
         }
     }
 
-    /** 投递引擎参数。 */
+    /**
+     * 投递引擎参数。
+     *
+     * <p>为什么 {@code workerPoolSize} 与 {@code batchSize} 是两个参数而不是一个：
+     * 前者是「同时能发多少个 HTTP」的物理上限，后者是「一次认领多少条」的批量口径。
+     * 认领数超过空闲 worker 数，多出来的行会在租约里空转，租约到期又被别人认领 ——
+     * 自己制造重复投递（D4.5）。调度器每次只认领 {@code min(batchSize, 空闲槽位)}。</p>
+     *
+     * @param pollIntervalMs      基础轮询间隔；空轮询时退避到 {@code idleBackoffMaxMs}
+     * @param batchSize           单轮认领上限，必须 > 0
+     * @param leaseDurationSeconds 租约时长，启动断言要求 > HTTP 总超时 + 5s
+     * @param workerPoolSize      投递线程数 = 同时在途的 HTTP 上限
+     * @param idleBackoffMaxMs    队列持续为空时的最大轮询间隔（T4.10）；@Scheduled 仍按基础间隔醒来，
+     *                            但只是做一次时间比较、不碰 DB，因此 DB QPS 实际下降
+     * @param hostConcurrency     单个下游 host 的并发上限（T4.9）：一家供应商变慢不该拖垮其他家
+     * @param requeueDelayMs      抢不到 host 许可时的重新排队延迟 —— 必须回退 attempt_count（T5.7 的前身）
+     * @param shutdownAwaitSeconds 停机时等待在途投递完成的上限；超时后交给租约自然回收
+     */
     public record Dispatch(
             int pollIntervalMs,
             int batchSize,
-            int leaseDurationSeconds) {
+            int leaseDurationSeconds,
+            int workerPoolSize,
+            int idleBackoffMaxMs,
+            int hostConcurrency,
+            int requeueDelayMs,
+            int shutdownAwaitSeconds) {
+
+        /** 兼容构造：其余参数取默认值（单测构造配置时用，避免每个用例都写 8 个参数）。 */
+        public Dispatch(int pollIntervalMs, int batchSize, int leaseDurationSeconds) {
+            this(pollIntervalMs, batchSize, leaseDurationSeconds, 32);
+        }
+
+        /** 兼容构造：其余参数取默认值（单测构造配置时用，避免每个用例都写 8 个参数）。 */
+        public Dispatch(int pollIntervalMs, int batchSize, int leaseDurationSeconds, int workerPoolSize) {
+            this(pollIntervalMs, batchSize, leaseDurationSeconds, workerPoolSize, 2_000, 8, 200, 20);
+        }
+
+        public Dispatch {
+            if (pollIntervalMs <= 0) {
+                throw new IllegalStateException("配置错误：notification.dispatch.poll-interval-ms 必须 > 0");
+            }
+            if (batchSize <= 0) {
+                throw new IllegalStateException("配置错误：notification.dispatch.batch-size 必须 > 0");
+            }
+            if (workerPoolSize <= 0) {
+                throw new IllegalStateException("配置错误：notification.dispatch.worker-pool-size 必须 > 0");
+            }
+            if (hostConcurrency <= 0) {
+                throw new IllegalStateException("配置错误：notification.dispatch.host-concurrency 必须 > 0");
+            }
+            if (idleBackoffMaxMs < pollIntervalMs) {
+                // 退避上限比基础间隔还小，等于"退避"变"加速" —— 配置意图被反过来了
+                throw new IllegalStateException(
+                        "配置错误：idle-backoff-max-ms(%d) 不得小于 poll-interval-ms(%d)"
+                                .formatted(idleBackoffMaxMs, pollIntervalMs));
+            }
+        }
     }
 
-    /** 出站 HTTP 预算（D2）。 */
-    public record Http(
-            int connectTimeoutMs,
-            int totalTimeoutMs) {
+    /**
+     * 出站 HTTP 预算（D2）。
+     *
+     * <p><b>只有两段，不是三段</b>：JDK {@code HttpClient} 提供 connectTimeout 与「整个请求」的
+     * timeout，没有独立的 socket read timeout。T4.4 原本写的「connect 3s / read 10s / total 15s」
+     * 是照 Apache HttpClient 的接口设计的。为了三段超时引入第二个 HTTP 客户端，
+     * 换来的是一个已被总超时覆盖的能力 —— 不划算，因此把 read 超时并入 total，
+     * 并把这条偏差记在设计文档 §9.9（"实现与任务清单不一致时，改清单而不是硬凑"）。</p>
+     *
+     * @param connectTimeoutMs TCP 建连上限；DNS 解析也受它约束
+     * @param totalTimeoutMs   整个请求（建连 + 发送 + 等待响应）的上限
+     */
+    public record Http(int connectTimeoutMs, int totalTimeoutMs) {
+
+        public Http {
+            if (connectTimeoutMs <= 0 || totalTimeoutMs <= 0) {
+                throw new IllegalStateException("配置错误：HTTP 超时必须 > 0");
+            }
+            if (connectTimeoutMs > totalTimeoutMs) {
+                // 建连预算比总预算还大，等于总超时永远先触发，connect 配置形同虚设
+                throw new IllegalStateException(
+                        "配置错误：connect-timeout-ms(%d) 不得大于 total-timeout-ms(%d)"
+                                .formatted(connectTimeoutMs, totalTimeoutMs));
+            }
+        }
     }
 
-    /** 重试预算默认值（按 RetryPolicy 档位可覆盖，P5 实现）。 */
-    public record Retry(
-            int defaultMaxAttempts) {
+    /**
+     * 重试预算与节奏。
+     *
+     * @param defaultMaxAttempts 默认档位（STANDARD）的最大尝试次数
+     * @param fixedDelaySeconds  <b>P4 阶段的占位退避</b>：固定延迟，只保证状态机闭环能跑通。
+     *                           P5 会换成「指数 + 抖动 + 上限」的 BackoffCalculator，
+     *                           届时本字段退役 —— 之所以先放配置而不写死常量，是为了让它可观察、
+     *                           也让 P5 的替换只动一个实现类
+     */
+    public record Retry(int defaultMaxAttempts, int fixedDelaySeconds) {
+
+        /** 兼容构造：固定延迟取 30s（P4 占位值）。 */
+        public Retry(int defaultMaxAttempts) {
+            this(defaultMaxAttempts, 30);
+        }
+
+        public Retry {
+            if (defaultMaxAttempts <= 0) {
+                throw new IllegalStateException("配置错误：retry.default-max-attempts 必须 > 0");
+            }
+            if (fixedDelaySeconds <= 0) {
+                throw new IllegalStateException("配置错误：retry.fixed-delay-seconds 必须 > 0");
+            }
+        }
     }
 
     /**
