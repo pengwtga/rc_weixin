@@ -30,9 +30,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * T2.4/T2.5 DoD：Repository 的行为必须用真实 MySQL 验证 —— 认领 SQL 的
  * SKIP LOCKED 语义、租约回收、唯一键仲裁，H2 上根本测不出来。
  */
-// 关掉后台调度：@SpringBootTest 会把 DispatcherPoller 一起拉起来，
-// 它会认领本用例插入的行并真发 HTTP（example.com），把断言数据改成 DEAD
-@SpringBootTest(properties = "notification.dispatch.auto-start=false")
+@SpringBootTest
 @Testcontainers
 class NotificationRepositoryIT {
 
@@ -52,9 +50,6 @@ class NotificationRepositoryIT {
     @Autowired
     NotificationRepository repository;
 
-    @Autowired
-    org.springframework.jdbc.core.JdbcTemplate jdbc;
-
     @BeforeEach
     void clean() {
         repository.deleteAllForTest();
@@ -64,7 +59,7 @@ class NotificationRepositoryIT {
         Timestamp now = new Timestamp(System.currentTimeMillis());
         return new NotificationRow(0, no, caller, key,
                 "https://hooks.vendor.example.com/v1", "POST",
-                null, new byte[]{1}, "ab".repeat(32),
+                null, new byte[]{1},
                 "PENDING", 0, 10, 0, now, null, null, null, null, now, now);
     }
 
@@ -111,7 +106,7 @@ class NotificationRepositoryIT {
         NotificationRow r = row("01TESTNO0000000000000000G", "sys_ads", "order_paid:p5");
         // 把 next_attempt_at 推到未来：模拟退避中
         NotificationRow future = new NotificationRow(0, r.notificationNo(), r.callerId(), r.idempotencyKey(),
-                r.targetUrl(), r.httpMethod(), r.headersEnc(), r.bodyEnc(), r.bodyFingerprint(),
+                r.targetUrl(), r.httpMethod(), r.headersEnc(), r.bodyEnc(),
                 "PENDING", 0, 10, 0,
                 new Timestamp(System.currentTimeMillis() + 60_000),
                 null, null, null, null, r.createdAt(), r.updatedAt());
@@ -162,17 +157,14 @@ class NotificationRepositoryIT {
             final String workerId = "worker-" + w;
             pool.submit(() -> {
                 start.await();
-                // 用「直到认领完或超时」而不是固定轮数：SKIP LOCKED 的语义就是
-                // "这一轮被别人锁住的行我不等"。并发高时某一轮拿到 0 条是正常的，
-                // 甚至个别行会连续几轮被跳过（别人正要锁它）。固定 20 轮会把
-                // 这种正常竞争误判成丢任务 —— 测的是"最终都能被认领且不重复"，
-                // 不是"平均每轮拿多少"。
-                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-                while (claimedNos.size() < total && System.nanoTime() < deadline) {
+                for (int round = 0; round < 20; round++) {
                     List<NotificationRow> batch = repository.claimDue(workerId, 60, 100);
                     totalClaimed.addAndGet(batch.size());
                     batch.forEach(r -> assertThat(claimedNos.add(r.notificationNo()))
                             .as("任务 %s 被重复认领", r.notificationNo()).isTrue());
+                    if (claimedNos.size() >= total) {
+                        break;
+                    }
                 }
                 return null;
             });
@@ -181,17 +173,7 @@ class NotificationRepositoryIT {
         pool.shutdown();
         assertThat(pool.awaitTermination(60, TimeUnit.SECONDS)).isTrue();
 
-        // 诊断：未认领的行到底是什么状态？PENDING 说明"扫不到"，PROCESSING 说明"认领了但没返回"
-        java.util.Map<String, String> missing = new java.util.HashMap<>();
-        jdbc.query("SELECT notification_no, status, lease_owner FROM notification",
-                rs -> {
-                    if (!claimedNos.contains(rs.getString("notification_no"))) {
-                        missing.put(rs.getString("notification_no"),
-                                rs.getString("status") + "/" + rs.getString("lease_owner"));
-                    }
-                });
-
-        assertThat(claimedNos).as("未被认领的行及状态=%s", missing).hasSize(total); // 每条恰好被认领一次
+        assertThat(claimedNos).hasSize(total); // 每条恰好被认领一次
         assertThat(totalClaimed.get()).isEqualTo(total);
     }
 

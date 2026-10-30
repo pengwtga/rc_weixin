@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.rightcapital.notify.api.dto.CreateNotificationRequest;
 import com.rightcapital.notify.api.dto.CreateNotificationResponse;
 import com.rightcapital.notify.common.apierror.ApiException;
-import com.rightcapital.notify.common.crypto.ContentFingerprint;
 import com.rightcapital.notify.common.crypto.PayloadCipher;
 import com.rightcapital.notify.common.idgen.Ulid;
 import com.rightcapital.notify.common.storage.NotificationRepository;
@@ -43,8 +42,6 @@ public class NotificationService {
     private final ObjectMapper objectMapper;
     private final io.micrometer.core.instrument.MeterRegistry meterRegistry;
     private final PayloadCipher payloadCipher;
-    private final ContentFingerprint fingerprint;
-    private final com.rightcapital.notify.dispatcher.DispatchHintQueue hintQueue;
 
     public NotificationService(NotificationRepository repository,
                                UrlPolicy urlPolicy,
@@ -53,9 +50,7 @@ public class NotificationService {
                                NotificationProperties properties,
                                ObjectMapper objectMapper,
                                io.micrometer.core.instrument.MeterRegistry meterRegistry,
-                               PayloadCipher payloadCipher,
-                               ContentFingerprint fingerprint,
-                               com.rightcapital.notify.dispatcher.DispatchHintQueue hintQueue) {
+                               PayloadCipher payloadCipher) {
         this.repository = repository;
         this.urlPolicy = urlPolicy;
         this.rateLimiter = rateLimiter;
@@ -64,8 +59,6 @@ public class NotificationService {
         this.objectMapper = objectMapper;
         this.meterRegistry = meterRegistry;
         this.payloadCipher = payloadCipher;
-        this.fingerprint = fingerprint;
-        this.hintQueue = hintQueue;
     }
 
     /**
@@ -90,7 +83,7 @@ public class NotificationService {
         byte[] bodyBytes = request.body() == null ? null : request.body().getBytes(StandardCharsets.UTF_8);
 
         // 密封发生在落库之前：明文 body（含手机号/邮箱/金额）与 headers（含供应商凭证）
-        // 不经过任何持久化路径。指纹取的是明文，用于归档清空 body 后的"内容是否一致"比对。
+        // 不经过任何持久化路径。
         byte[] sealedBody = payloadCipher.seal(bodyBytes, PayloadCipher.aadFor(notificationNo, "body"));
         byte[] sealedHeaders = payloadCipher.seal(toJsonBytes(request.headers()),
                 PayloadCipher.aadFor(notificationNo, "headers"));
@@ -104,7 +97,6 @@ public class NotificationService {
                 request.httpMethod(),
                 sealedHeaders,
                 sealedBody,
-                fingerprint.of(bodyBytes),
                 "PENDING",
                 0,
                 properties.retry().defaultMaxAttempts(),
@@ -120,9 +112,6 @@ public class NotificationService {
         try {
             repository.insertPending(row);
             counter(callerId, "accepted").increment();
-            // T4.12 insert-then-hint：落库成功才发提示（顺序不能反 ——
-            // 先提示后落库，调度器可能认领不到而白跑；更糟的是落库失败时留下幻觉）
-            hintQueue.offer(row.notificationNo());
             log.info("通知已受理 no={} caller={} url={}", row.notificationNo(), callerId, request.targetUrl());
             return CreateNotificationResponse.created(row.notificationNo());
         } catch (DuplicateKeyException e) {

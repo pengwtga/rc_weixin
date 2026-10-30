@@ -48,22 +48,9 @@ class NotificationPropertiesTest {
         NotificationProperties.Http http = new NotificationProperties.Http(3_000, 15_000);
 
         assertThatThrownBy(() -> new NotificationProperties(DISPATCH, http, RETRY, null, null, null,
-                new NotificationProperties.Crypto(null, null, true)))
+                new NotificationProperties.Crypto(null, true)))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("reject-dev-keys");
-    }
-
-    @Test
-    void 加密与指纹不得共用同一把密钥() {
-        NotificationProperties.Http http = new NotificationProperties.Http(3_000, 15_000);
-
-        assertThatThrownBy(() -> new NotificationProperties(DISPATCH, http, RETRY, null, null, null,
-                new NotificationProperties.Crypto(
-                        NotificationProperties.Crypto.DEV_BODY_KEY,
-                        NotificationProperties.Crypto.DEV_BODY_KEY,
-                        false)))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("密钥分离");
     }
 
     @Test
@@ -73,7 +60,7 @@ class NotificationPropertiesTest {
         String shortKey = java.util.Base64.getEncoder().encodeToString(new byte[16]);
 
         assertThatThrownBy(() -> new NotificationProperties(DISPATCH, http, RETRY, null, null, null,
-                new NotificationProperties.Crypto(shortKey, NotificationProperties.Crypto.DEV_FINGERPRINT_KEY, false)))
+                new NotificationProperties.Crypto(shortKey, false)))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("32 字节");
     }
